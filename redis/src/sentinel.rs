@@ -127,8 +127,6 @@
 
 #[cfg(feature = "aio")]
 use crate::aio::MultiplexedConnection as AsyncConnection;
-#[cfg(feature = "aio")]
-use futures_util::StreamExt;
 use rand::Rng;
 #[cfg(feature = "r2d2")]
 use std::sync::Mutex;
@@ -316,10 +314,24 @@ fn determine_master_from_role_or_info_replication(
     evaluate_role_check_errors(role_result.unwrap_err(), fallback_role_result.unwrap_err())
 }
 
-fn get_node_role(connection_info: &ConnectionInfo) -> RedisResult<Role> {
+fn determine_slave_from_role_or_info_replication(
+    connection_info: &ConnectionInfo,
+) -> RedisResult<bool> {
     let client = Client::open(connection_info.clone())?;
     let mut conn = client.get_connection()?;
-    crate::cmd("ROLE").query(&mut conn)
+
+    let role_result = check_role(&mut conn);
+    if let Ok(role) = role_result {
+        return Ok(matches!(role, Role::Replica { .. }));
+    }
+
+    //If the ROLE commands is not available (it was introduced in Redis 2.8.12), a client may resort to the INFO replication command parsing the role: field of the output.
+    let fallback_role_result = check_info_replication(&mut conn);
+    if let Ok(role) = fallback_role_result {
+        return Ok(role == "slave");
+    }
+
+    evaluate_role_check_errors(role_result.unwrap_err(), fallback_role_result.unwrap_err())
 }
 
 fn check_role(conn: &mut Connection) -> RedisResult<Role> {
@@ -473,96 +485,41 @@ async fn async_find_valid_master(
     ))
 }
 
-#[cfg(not(feature = "tls-rustls"))]
 fn get_valid_replicas_addresses(
     replicas: Vec<HashMap<String, String>>,
     node_connection_info: &SentinelNodeConnectionInfo,
+    #[cfg(feature = "tls-rustls")] certs: &Option<TlsCertificates>,
 ) -> RedisResult<Vec<ConnectionInfo>> {
-    let addresses = valid_addrs(replicas, is_replica_valid)
-        .map(|(ip, port)| node_connection_info.create_connection_info(ip, port))
-        .collect::<RedisResult<Vec<ConnectionInfo>>>()?;
-
-    Ok(addresses
-        .into_iter()
-        .filter(|connection_info| {
-            get_node_role(connection_info).is_ok_and(|x| matches!(x, Role::Replica { .. }))
-        })
-        .collect())
+    let mut connection_infos = Vec::new();
+    for (ip, port) in valid_addrs(replicas, is_replica_valid) {
+        #[cfg(not(feature = "tls-rustls"))]
+        let connection_info = node_connection_info.create_connection_info(ip, port)?;
+        #[cfg(feature = "tls-rustls")]
+        let connection_info = node_connection_info.create_connection_info(ip, port, certs)?;
+        if determine_slave_from_role_or_info_replication(&connection_info)? {
+            connection_infos.push(connection_info);
+        }
+    }
+    Ok(connection_infos)
 }
 
-#[cfg(feature = "tls-rustls")]
-fn get_valid_replicas_addresses(
-    replicas: Vec<HashMap<String, String>>,
-    node_connection_info: &SentinelNodeConnectionInfo,
-    certs: &Option<TlsCertificates>,
-) -> RedisResult<Vec<ConnectionInfo>> {
-    let addresses = valid_addrs(replicas, is_replica_valid)
-        .map(|(ip, port)| node_connection_info.create_connection_info(ip, port, certs))
-        .collect::<RedisResult<Vec<ConnectionInfo>>>()?;
-
-    Ok(addresses
-        .into_iter()
-        .filter(|connection_info| {
-            get_node_role(connection_info).is_ok_and(|x| matches!(x, Role::Replica { .. }))
-        })
-        .collect())
-}
-
-#[cfg(all(feature = "aio", not(feature = "tls-rustls")))]
+#[cfg(feature = "aio")]
 async fn async_get_valid_replicas_addresses(
     replicas: Vec<HashMap<String, String>>,
     node_connection_info: &SentinelNodeConnectionInfo,
+    #[cfg(feature = "tls-rustls")] certs: &Option<TlsCertificates>,
 ) -> RedisResult<Vec<ConnectionInfo>> {
-    async fn is_replica_role_valid(connection_info: ConnectionInfo) -> Option<ConnectionInfo> {
-        match async_determine_slave_from_role_or_info_replication(&connection_info).await {
-            Ok(x) => {
-                if x {
-                    Some(connection_info)
-                } else {
-                    None
-                }
-            }
-            Err(_e) => None,
+    let mut connection_infos = Vec::new();
+    for (ip, port) in valid_addrs(replicas, is_replica_valid) {
+        #[cfg(not(feature = "tls-rustls"))]
+        let connection_info = node_connection_info.create_connection_info(ip, port)?;
+        #[cfg(feature = "tls-rustls")]
+        let connection_info = node_connection_info.create_connection_info(ip, port, certs)?;
+        if async_determine_slave_from_role_or_info_replication(&connection_info).await? {
+            connection_infos.push(connection_info);
         }
     }
-
-    let addresses = valid_addrs(replicas, is_replica_valid)
-        .map(|(ip, port)| node_connection_info.create_connection_info(ip, port))
-        .collect::<RedisResult<Vec<_>>>()?;
-
-    Ok(futures_util::stream::iter(addresses)
-        .filter_map(is_replica_role_valid)
-        .collect()
-        .await)
-}
-
-#[cfg(all(feature = "aio", feature = "tls-rustls"))]
-async fn async_get_valid_replicas_addresses(
-    replicas: Vec<HashMap<String, String>>,
-    node_connection_info: &SentinelNodeConnectionInfo,
-    certs: &Option<TlsCertificates>,
-) -> RedisResult<Vec<ConnectionInfo>> {
-    async fn is_replica_role_valid(connection_info: ConnectionInfo) -> Option<ConnectionInfo> {
-        match async_determine_slave_from_role_or_info_replication(&connection_info).await {
-            Ok(x) => {
-                if x {
-                    Some(connection_info)
-                } else {
-                    None
-                }
-            }
-            Err(_e) => None,
-        }
-    }
-
-    let addresses = valid_addrs(replicas, is_replica_valid)
-        .map(|(ip, port)| node_connection_info.create_connection_info(ip, port, certs))
-        .collect::<RedisResult<Vec<_>>>()?;
-
-    Ok(futures_util::stream::iter(addresses)
-        .filter_map(is_replica_role_valid)
-        .collect()
-        .await)
+    Ok(connection_infos)
 }
 
 #[cfg(feature = "aio")]
@@ -813,7 +770,8 @@ impl Sentinel {
         Client::open(connection_info)
     }
 
-    /// Connects to a randomly chosen replica of the given master name.
+    /// Connects to a randomly chosen replica of the given master name. Errors can originate
+    /// from interaction either with Sentinel or with the replica.
     pub fn replica_for(
         &mut self,
         service_name: &str,
